@@ -1,6 +1,6 @@
 # QR-Nav: LLM-Based Mapless Zero-Shot Object Goal Navigation
 
-<img width="900" alt="system architecture" src="./assets/architecture.png">
+<img width="900" alt="system architecture" src="./assets/qr-nav.png">
 
 ---
 
