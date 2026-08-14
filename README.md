@@ -36,7 +36,7 @@ numpy, opencv-python, tqdm, openai, torch, imageio
 Clone this repository:
 
 ```bash
-git clone https://github.com/<your-username>/QR-Nav.git
+git clone https://github.com/ytcheng0822/QR-Nav.git
 cd QR-Nav
 ```
 
