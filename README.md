@@ -63,8 +63,7 @@ pip install -e .
 This project uses GPT-4o for panoramic visual reasoning. Set your API credentials as environment variables:
 
 ```bash
-export OPENAI_API_KEY=<YOUR_KEY>
-export OPENAI_API_ENDPOINT=<YOUR_ENDPOINT>
+export OPENROUTER_API_KEY="<YOUR KEYS>"
 ```
 
 See `./llm_utils/gpt_request.py` for details on the API interface.
@@ -113,17 +112,18 @@ python qr-nav.py --dataset hm3d --episode_id 9 --scene_id 6s7QHgap2fW
 python qr-nav.py --dataset mp3d --start_episode 100 --eval_episodes 900
 
 # Coverage mode: ensure all scenes and object categories are tested at least once
-python qr-nav.py --dataset mp3d --eval_episodes 100 --coverage
+python qr-nav.py --dataset mp3d --eval_episodes 2195 --coverage
 ```
 
----
+### Ablation Study
 
-## Results
+```bash
+# Full method (default)
+python ablation.py --ablation full
 
-### HM3D ObjectNav (val, 1000 episodes)
+# w/o Semantic Memory Queue
+python ablation.py --ablation no_memory
 
-| Method | SR ↑ | SPL ↑ |
-| :--- | :---: | :---: |
-| **QR-Nav (Full)** | **0.554** | **0.276** |
-| w/o Re-perception Module | 0.480 | 0.257 |
-| w/o Semantic Memory Queue | 0.430 | 0.237 |
+# w/o Re-perception Module
+python ablation.py --ablation no_reperception
+```
