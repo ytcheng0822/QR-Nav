@@ -19,10 +19,10 @@ This project is built on [habitat-sim](https://github.com/facebookresearch/habit
 
 - **Scenes & Episodes**: [HM3D, MP3D](https://github.com/facebookresearch/habitat-lab/blob/main/DATASETS.md)
 
-Additional Python dependencies:
+Create conda environment:
 
-```
-numpy, opencv-python, tqdm, openai, torch, imageio
+```bash
+conda env create -f environment.yml
 ```
 
 ## Repository Structure
