@@ -6,13 +6,14 @@ import csv
 import cv2
 import imageio
 import numpy as np
+import random
 import time
 
 from cv_utils.detection_tools import *
 from cv_utils.segmentation_tools import *
 from tqdm import tqdm
 from constants import *
-from config_utils import hm3d_config, mp3d_config
+from config_utils import hm3d_config
 from gpt4o_planner import GPT4o_Planner
 from policy_agent import Policy_Agent
 from depth_estimator import DepthEstimator
@@ -36,18 +37,12 @@ def print_and_log(message):
         f.write(message + "\n")
 
 
-def write_metrics(metrics, path, write_header=False):
-    """Write evaluation results to CSV.
-    write_header=True writes column names (for the first write only).
-    Subsequent calls use append mode to add only the latest row.
-    """
-    mode = "w" if write_header else "a"
-    with open(path, mode=mode, newline="") as csv_file:
+def write_metrics(metrics, path="objnav_hm3d.csv"):
+    with open(path, mode="w", newline="") as csv_file:
         fieldnames = metrics[0].keys()
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(metrics[-1])
+        writer.writeheader()
+        writer.writerows(metrics)
 
 
 def adjust_topdown(metrics):
@@ -56,31 +51,35 @@ def adjust_topdown(metrics):
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="hm3d", choices=["hm3d", "mp3d"],
-                        help="Dataset to evaluate: hm3d (default) or mp3d")
-    parser.add_argument("--start_episode", type=int, default=0,
-                        help="Episode index to start from (0-based), for resuming a run")
-    parser.add_argument("--eval_episodes", type=int, default=None,
-                        help="Number of episodes to evaluate; runs the full dataset if not specified")
-    parser.add_argument("--coverage", action="store_true",
-                        help="Coverage mode: select at least one episode per scene and object category, then fill up to --eval_episodes")
+    parser.add_argument("--eval_episodes", type=int, default=100)
     parser.add_argument("--episode_id", type=str, default=None,
                         help="Run only a specific episode_id, e.g. --episode_id 9")
     parser.add_argument("--scene_id", type=str, default=None,
-                        help="Used with --episode_id to disambiguate across scenes, e.g. --scene_id 6s7QHgap2fW")
+                        help="Used with --episode_id to disambiguate across scenes")
+    # Ablation mode (choose one):
+    #   full             Full method (default)
+    #   no_memory        w/o Semantic Memory Queue
+    #   no_reperception  w/o Re-perception Module
+    parser.add_argument(
+        "--ablation",
+        type=str,
+        default="full",
+        choices=["full", "no_memory", "no_reperception"],
+        help=(
+            "Ablation mode:\n"
+            "  full             Full method (default)\n"
+            "  no_memory        w/o Semantic Memory Queue\n"
+            "  no_reperception  w/o Re-perception Module"
+        ),
+    )
     return parser.parse_args()
 
 
 # Action codes (0-5) follow the original Habitat action space definition.
 def step_and_capture(env, action, episode_images, episode_topdowns, display_image=None):
-    """Execute one action and record the frame and top-down map.
-
-    Both obs['rgb'] (from Habitat) and skill_image (from policy_agent) are in RGB,
-    so no colour conversion is needed before storing.
-    """
+    """Execute one action and record the frame and top-down map."""
     obs = env.step(action)
-    frame = np.array(display_image if display_image is not None else obs['rgb'])
-    episode_images.append(frame)
+    episode_images.append(display_image if display_image is not None else obs['rgb'])
     episode_topdowns.append(adjust_topdown(env.get_metrics()))
     return obs
 
@@ -179,35 +178,41 @@ def render_episode_videos(episode_dir, episode_images, episode_topdowns, current
 
 
 # ==================================================
-# Initialization
+# Ablation Mode Setup
 # ==================================================
 args = get_args()
+ablation_mode = args.ablation
+ABLATION_LABELS = {
+    "full":            "Full Method",
+    "no_memory":       "w/o Semantic Memory Queue",
+    "no_reperception": "w/o Re-perception Module",
+}
+print_and_log("=" * 50)
+print_and_log(f"Mode: {ABLATION_LABELS[ablation_mode]}")
+print_and_log("=" * 50)
 
-DATASET_CONFIG = {"hm3d": hm3d_config, "mp3d": mp3d_config}
-CSV_OUTPUT     = {"hm3d": "objnav_hm3d.csv", "mp3d": "objnav_mp3d.csv"}
-
-dataset_config_fn = DATASET_CONFIG[args.dataset]
-csv_path = CSV_OUTPUT[args.dataset]
-print_and_log(f"資料集：{args.dataset.upper()}  |  結果儲存至：{csv_path}")
-
-habitat_config = (
-    dataset_config_fn(stage='val')
-    if args.eval_episodes is None
-    else dataset_config_fn(stage='val', episodes=args.eval_episodes)
-)
+# ==================================================
+# Initialization
+# ==================================================
+habitat_config = hm3d_config(stage='val', episodes=args.eval_episodes)
 habitat_env = habitat.Env(habitat_config)
 detection_model = initialize_dino_model()
 segmentation_model = initialize_sam_model()
 
-nav_planner = GPT4o_Planner(detection_model, segmentation_model, dataset=args.dataset)
+nav_planner = GPT4o_Planner(
+    detection_model, segmentation_model,
+    use_memory=(ablation_mode != "no_memory"),
+)
 nav_executor = Policy_Agent(model_path=POLICY_CHECKPOINT)
 
 print_and_log("Loading Depth Module for Distance Measurement...")
+# DepthEstimator is always loaded; under no_reperception it is not called —
+# the policy's Stop action is accepted directly without depth validation.
 depth_estimator = DepthEstimator(model_type='vits')
+if ablation_mode == "no_reperception":
+    print_and_log("[Ablation] Re-perception Module disabled: Stop action accepted directly.")
 
 evaluation_metrics = []
-# Write header only when starting a new CSV; append to an existing file when resuming.
-csv_header_written = os.path.exists(csv_path)
 
 # ==================================================
 # Episode Selection
@@ -229,59 +234,17 @@ if args.episode_id is not None:
         )
     if len(sampled_episodes) > 1:
         print_and_log(
-            f"找到 {len(sampled_episodes)} 個 episode_id={args.episode_id} 的回合（不同場景），"
-            f"全部一起重跑；若只想跑其中一個，請加上 --scene_id 篩選。"
+            f"Found {len(sampled_episodes)} episodes with id={args.episode_id} across different scenes. "
+            f"Running all of them; add --scene_id to select one."
         )
     sample_size = len(sampled_episodes)
-    print_and_log(f"除錯模式：只重跑指定的 {sample_size} 個回合 (episode_id={args.episode_id}) ...")
+    print_and_log(f"Debug mode: running {sample_size} episode(s) with episode_id={args.episode_id}")
 else:
-    if args.coverage:
-        # Coverage mode: guarantee at least one episode per scene and object category,
-        # then fill the remaining budget in dataset order.
-        seen_scenes = set()
-        seen_goals  = set()
-        must_have   = []
-        remaining   = []
-
-        for ep in all_episodes:
-            scene = os.path.basename(ep.scene_id)
-            goal  = ep.object_category
-            if scene not in seen_scenes or goal not in seen_goals:
-                must_have.append(ep)
-                seen_scenes.add(scene)
-                seen_goals.add(goal)
-            else:
-                remaining.append(ep)
-
-        budget = args.eval_episodes if args.eval_episodes is not None else len(all_episodes)
-        if len(must_have) > budget:
-            sampled_episodes = must_have[:budget]
-            print_and_log(
-                f"budget={budget} 不足以覆蓋所有場景和類別（最少需要 {len(must_have)} 個），"
-                f"只選了前 {budget} 個覆蓋 episode。"
-            )
-        else:
-            fill_count = budget - len(must_have)
-            sampled_episodes = must_have + remaining[:fill_count]
-
-        sample_size = len(sampled_episodes)
-        covered_scenes = len({os.path.basename(ep.scene_id) for ep in sampled_episodes})
-        covered_goals  = len({ep.object_category for ep in sampled_episodes})
-        print_and_log(
-            f"覆蓋模式：共 {sample_size} 個回合 | "
-            f"場景覆蓋 {covered_scenes} 個 | 物件類別覆蓋 {covered_goals} 個"
-        )
-        start = 0
-    else:
-        # Normal mode: run episodes in dataset order starting from start_episode.
-        start = max(0, min(args.start_episode, len(all_episodes)))
-        if args.eval_episodes is None:
-            end = len(all_episodes)
-        else:
-            end = min(start + args.eval_episodes, len(all_episodes))
-        sampled_episodes = all_episodes[start:end]
-        sample_size = len(sampled_episodes)
-        print_and_log(f"共 {sample_size} 個回合準備測試（第 {start}～{end-1} 個，資料集原始順序）...")
+    sample_size = min(args.eval_episodes, len(all_episodes))
+    # Fixed seed for reproducible ablation comparisons.
+    random.seed(42)
+    sampled_episodes = random.sample(all_episodes, sample_size)
+    print_and_log(f"Sampled {sample_size} episodes (seed=42)")
 
 # Override the environment's episode iterator with the selected list.
 try:
@@ -305,13 +268,13 @@ for i in tqdm(range(sample_size)):
     episode_start_time = time.time()
     print_and_log(f"\n▶ [Episode {i+1}/{sample_size}] ID: {ep_id} | 場景: {scene_name} | 目標: {current_goal_name}")
 
-    episode_dir = "./tmp/trajectory_%d" % (i + (start if args.episode_id is None else 0))
+    episode_dir = "./tmp/trajectory_%d" % i
     os.makedirs(episode_dir, exist_ok=False)
 
     heading_offset = 0
 
     nav_planner.reset(current_goal_name)
-    episode_images  = [np.array(obs['rgb'])]
+    episode_images  = [obs['rgb']]
     episode_topdowns = [adjust_topdown(habitat_env.get_metrics())]
 
     # Initial planning: spin to collect panorama, select goal direction, rotate toward it.
@@ -319,7 +282,7 @@ for i in tqdm(range(sample_size)):
     goal_image, goal_mask, _, goal_rotate, goal_flag = nav_planner.make_plan(episode_images[-12:])
     obs = rotate_to_goal_direction(habitat_env, episode_images, episode_topdowns, obs, goal_rotate)
 
-    nav_executor.reset(cv2.cvtColor(goal_image, cv2.COLOR_RGB2BGR), goal_mask)
+    nav_executor.reset(goal_image, goal_mask)
 
     collision_count = 0
     # Tracks the closest distance at which DINO confirmed the target this round.
@@ -348,17 +311,28 @@ for i in tqdm(range(sample_size)):
 
         # Step 2: DINO target detection and distance measurement.
         if goal_flag:
-            rgb_image = obs['rgb']
+            rgb_image = cv2.cvtColor(obs['rgb'], cv2.COLOR_BGR2RGB) if obs['rgb'].shape[-1] == 3 else obs['rgb']
 
             current_box_thresh  = 0.2
             current_text_thresh = 0.4
 
-            # MP3D categories use prompt overrides to improve DINO recall (no-op for HM3D).
-            detect_prompt = nav_planner.dino_prompt_override.get(nav_planner.object_goal, nav_planner.object_goal)
+            if nav_planner.object_goal == 'tv':
+                current_box_thresh  = 0.3
+                current_text_thresh = 0.25
+            elif nav_planner.object_goal == 'chair':
+                current_box_thresh  = 0.35
+                current_text_thresh = 0.4
+            elif nav_planner.object_goal == 'toilet':
+                current_box_thresh  = 0.35
+                current_text_thresh = 0.4
+            elif nav_planner.object_goal == 'plant':
+                # plant is small and often partially in frame; relax threshold to match make_plan().
+                current_box_thresh  = 0.2
+                current_text_thresh = 0.25
 
             target_bbox = openset_detection(
                 rgb_image,
-                [detect_prompt],
+                [nav_planner.object_goal],
                 detection_model,
                 box_threshold=current_box_thresh,
                 text_threshold=current_text_thresh
@@ -373,16 +347,11 @@ for i in tqdm(range(sample_size)):
                 h_box = y2 - y1
                 aspect_ratio = w_box / h_box if h_box > 0 else 0
 
-                # For large MP3D furniture the box extends low in the frame when nearby;
-                # skip the floor-rug filter for those categories.
-                if nav_planner.object_goal in nav_planner.large_furniture:
-                    is_not_floor_rug = True
-                else:
-                    is_not_floor_rug = (y1 < h * 0.6)
-
+                is_not_floor_rug = (y1 < h * 0.6)
                 # Aspect-ratio filter: only applied to categories with predictable shapes.
+                # Disabled by default to avoid incorrectly rejecting tall/narrow objects like plants.
                 is_widescreen = True
-                if nav_planner.object_goal in ('tv', 'tv_monitor'):
+                if nav_planner.object_goal == 'tv':
                     is_widescreen = aspect_ratio > 0.55
                 elif nav_planner.object_goal == 'toilet':
                     is_widescreen = aspect_ratio > 0.3
@@ -419,10 +388,7 @@ for i in tqdm(range(sample_size)):
                 pending_target_streak = 0
 
         is_collided = habitat_env.sim.previous_step_collided
-        action, skill_image = nav_executor.step(
-            cv2.cvtColor(obs['rgb'], cv2.COLOR_RGB2BGR),
-            is_collided,
-        )
+        action, skill_image = nav_executor.step(obs['rgb'], is_collided)
 
         if is_collided:
             collision_count += 1
@@ -432,27 +398,27 @@ for i in tqdm(range(sample_size)):
         # Step 3: Re-perception stop validation (Premature Stop Rejected).
         if goal_flag:
             if action == 0:
-                if target_in_view and real_target_distance <= 2.0:
+                if ablation_mode == "no_reperception":
+                    # w/o Re-perception: accept Stop directly without depth validation.
+                    print_and_log("[消融 w/o Re-perception] 小腦停止，直接宣告成功！")
+                    action = 0
+                elif target_in_view and real_target_distance <= 2.0:
                     print_and_log(f"真正抵達 2.0m 內！(估測目標距離 {real_target_distance:.2f}m)，宣告成功！")
                     action = 0
                 elif not target_in_view and last_confirmed_target_distance <= 2.5 and front_distance <= 2.0:
                     # Blind-spot stop: target was recently confirmed close but is now out of view.
                     # A solid object ahead indicates the robot has reached the target.
-                    print_and_log(f"盲區觸地！目標曾於 {last_confirmed_target_distance:.2f}m 處確認，DINO 丟失，前方有實體 ({front_distance:.2f}m)，宣告成功！")
-                    action = 0
-                elif nav_planner.object_goal in nav_planner.dino_skip_verify and front_distance <= 2.0:
-                    # For categories that DINO cannot reliably detect, use depth as a proxy.
-                    print_and_log(f"深度觸地！'{nav_planner.object_goal}' 跳過 DINO，前方有實體 ({front_distance:.2f}m)，宣告成功！")
+                    print_and_log(f"盲區觸地得分！目標曾於 {last_confirmed_target_distance:.2f}m 處確認，DINO 丟失，前方有實體 ({front_distance:.2f}m)，宣告成功！")
                     action = 0
                 else:
                     dist_msg = f"{real_target_distance:.2f}m" if target_in_view else f"Lost (Front {front_distance:.2f}m)"
-                    print_and_log(f"過早放棄 (狀態: {dist_msg})。駁回 Stop，重新規劃！")
+                    print_and_log(f"小腦過早放棄 (狀態: {dist_msg})。駁回 Stop，交還大腦重新規劃！")
                     action = 0
                     goal_flag = False
                     collision_count = 0
 
             elif collision_count > 5:
-                print_and_log("偵測到連續碰撞卡死！放棄當前追蹤，重新尋找新路徑！")
+                print_and_log("偵測到連續碰撞卡死！放棄當前追蹤，交還大腦重新尋找新路徑！")
                 action = 0
                 goal_flag = False
                 collision_count = 0
@@ -480,7 +446,7 @@ for i in tqdm(range(sample_size)):
             goal_image, goal_mask, _, goal_rotate, goal_flag = nav_planner.make_plan(episode_images[-12:])
             obs = rotate_to_goal_direction(habitat_env, episode_images, episode_topdowns, obs, goal_rotate)
 
-            nav_executor.reset(cv2.cvtColor(goal_image, cv2.COLOR_RGB2BGR), goal_mask)
+            nav_executor.reset(goal_image, goal_mask)
             collision_count = 0
             last_confirmed_target_distance = 99.0
             pending_target_center = None
@@ -494,6 +460,7 @@ for i in tqdm(range(sample_size)):
     ep_elapsed = round(time.time() - episode_start_time, 1)
 
     evaluation_metrics.append({
+        'ablation':        ablation_mode,
         'episode_id':      ep_id,
         'scene_name':      scene_name,
         'success':         ep_success,
@@ -502,8 +469,7 @@ for i in tqdm(range(sample_size)):
         'object_goal':     current_goal_name,
         'elapsed_sec':     ep_elapsed,
     })
-    write_metrics(evaluation_metrics, path=csv_path, write_header=not csv_header_written)
-    csv_header_written = True
+    write_metrics(evaluation_metrics)
     print_and_log(f"Episode {ep_id} 結束。狀態儲存完畢 (SR: {ep_success}, SPL: {ep_spl}, 耗時: {ep_elapsed}s)")
 
 # ==================================================
@@ -533,6 +499,7 @@ if num_episodes > 0:
     print_and_log("=" * 50 + "\n")
 
     evaluation_metrics.append({
+        'ablation':        ablation_mode,
         'episode_id':      'ALL',
         'scene_name':      'FINAL_AVERAGE',
         'success':         final_sr,
@@ -541,4 +508,4 @@ if num_episodes > 0:
         'object_goal':     'ALL',
         'elapsed_sec':     total_elapsed,
     })
-    write_metrics(evaluation_metrics, path=csv_path, write_header=False)
+    write_metrics(evaluation_metrics)
