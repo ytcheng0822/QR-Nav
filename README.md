@@ -88,12 +88,12 @@ cd third_party/Depth-Anything-V2
 pip install -e .
 ```
 
-## Prepare GPT-4o API Keys
+## Prepare GPT-4o API Key
 
 This project uses GPT-4o for panoramic visual reasoning. Set your API credentials as environment variables:
 
 ```bash
-export OPENROUTER_API_KEY="<YOUR KEYS>"
+export OPENROUTER_API_KEY="<YOUR KEY>"
 ```
 
 See `./llm_utils/gpt_request.py` for details on the API interface.
